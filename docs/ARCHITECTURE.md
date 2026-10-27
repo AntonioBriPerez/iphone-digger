@@ -40,7 +40,7 @@ Una línea JSON por mensaje. Cada evento lleva su tipo en el campo `t`.
 | `crash` | `path` | Responde `crash` con el contenido del informe |
 | `screenshot` | — | Responde `screenshot` |
 | `live_screen` | `on` | Activa o desactiva el envío continuo de capturas |
-| `log_filter` | `text` | Filtra el syslog en origen (subcadena en el proceso o el mensaje) |
+| `log_filter` | `min_level`, `muted`, `only` | Filtra el syslog en origen: nivel mínimo (0 depuración … 3 errores), procesos silenciados y, opcionalmente, un único proceso. Es global y sobrevive a los cambios de dispositivo |
 
 ### Eventos (agente → app, por stdout)
 
@@ -53,7 +53,7 @@ Una línea JSON por mensaje. Cada evento lleva su tipo en el campo `t`.
 | `dev` | al cambiar | `status` (`ok` o `unavailable`) y `msg` |
 | `system` | cada 1 s | `cpu`, `per_cpu`, memoria y `rates` (bytes/s de red y disco) |
 | `procs` | cada 1 s | `items[{pid, name, cpu, mem, threads, power, disk_w}]` |
-| `logs` | cada 0,5 s | `items[{ts, pid, proc, level, msg}]` y `dropped` |
+| `logs` | cada 0,5 s | `items[{ts, pid, proc, level, msg, sub, cat}]`, `dropped` y `rate` (líneas/s que emite el iPhone) |
 | `apps`, `crashes`, `crash`, `screenshot` | bajo demanda | ver comandos |
 | `error` | cuando ocurre | `where`, `msg` |
 

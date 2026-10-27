@@ -20,7 +20,7 @@ Conecta un iPhone por cable y mira lo que pasa dentro: batería, CPU, memoria, p
 | **Procesos** | Todos los procesos (≈600) con CPU, memoria, energía, escrituras a disco e hilos; ordenables y filtrables | Sí |
 | **Pantalla** | Captura de la pantalla o espejo en vivo (~3 fps), con opción de guardar en PNG | Sí |
 | **Apps** | Apps instaladas con tamaño (binario + datos), permisos que declaran y modos de segundo plano | No |
-| **Logs en vivo** | El log del sistema en tiempo real, filtrable por proceso o texto | No |
+| **Logs en vivo** | El log del sistema en tiempo real con nivel por colores, filtro de nivel (por defecto oculta info y depuración), búsqueda con resaltado, ranking de procesos que más escriben (pulsa para ver solo uno o siléncialo), pausa sin perder líneas, detalle de cada línea con subsistema y exportación a `.log` | No |
 | **Fallos** | Informes de fallos (`.ips`), ranking de los procesos que más fallan y visor del informe completo | No |
 
 **Modo privado** (botón del ojo o ⇧⌘P): oculta el nombre del dispositivo, número de serie, UDID, IMEI, teléfono y MACs para poder compartir capturas.

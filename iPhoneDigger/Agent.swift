@@ -52,7 +52,11 @@ struct LogLine: Decodable, Identifiable {
     let ts: String
     let pid: Int
     let proc, level, msg: String
-    enum CodingKeys: String, CodingKey { case ts, pid, proc, level, msg }
+    let sub, cat: String?
+    enum CodingKeys: String, CodingKey { case ts, pid, proc, level, msg, sub, cat }
+
+    /// Same ranks as LEVEL_RANK in agent.py.
+    var rank: Int { ["DEBUG": 0, "INFO": 1, "ERROR": 3, "FAULT": 4][level] ?? 2 }
 }
 
 struct AppItem: Decodable, Identifiable {
@@ -76,11 +80,29 @@ struct Point: Identifiable {
 
 private struct Envelope: Decodable { let t: String }
 private struct Items<T: Decodable>: Decodable { let items: [T] }
-private struct Logs: Decodable { let items: [LogLine]; let dropped: Int }
+private struct Logs: Decodable { let items: [LogLine]; let dropped: Int; let rate: Int? }
 private struct Dev: Decodable { let status: String; let msg: String? }
 private struct Crash: Decodable { let path, text: String }
 private struct Shot: Decodable { let png: String }
 private struct AgentError: Decodable { let `where`: String; let msg: String }
+
+/// Turns the agent's stdout chunks into complete lines. Only touched from the pipe's serial handler queue.
+final class LineSplitter: @unchecked Sendable {
+    private var buffer = Data()
+
+    func feed(_ data: Data) -> [Data] {
+        var from = buffer.endIndex  // only new bytes can hold an unseen newline; rescanning made big lines quadratic
+        buffer.append(data)
+        var start = buffer.startIndex, lines: [Data] = []
+        while let nl = buffer[from...].firstIndex(of: 0x0A) {
+            lines.append(Data(buffer[start..<nl]))
+            start = nl + 1
+            from = start
+        }
+        buffer.removeSubrange(buffer.startIndex..<start)
+        return lines
+    }
+}
 
 // MARK: - Bridge to the Python agent
 
@@ -93,6 +115,7 @@ final class Agent {
     var procs: [Proc] = []
     var logs: [LogLine] = []
     var logsDropped = 0
+    var logRate = 0
     var apps: [AppItem]?
     var crashes: [String]?
     var crash: (path: String, text: String)?
@@ -107,7 +130,6 @@ final class Agent {
     var netOutHistory: [Point] = []
     var powerHistory: [Point] = []
 
-    var logsPaused = false
     /// Hides identifiers (serial, UDID, IMEI, phone, MACs, device name) so screenshots can be shared.
     var privacy = UserDefaults.standard.bool(forKey: "privacy") { didSet { UserDefaults.standard.set(privacy, forKey: "privacy") } }
     static let sensitiveFields: Set<String> = ["Nombre", "Número de serie", "UDID", "MAC Wi-Fi", "MAC Bluetooth", "Teléfono", "IMEI", "IMEI 2"]
@@ -117,10 +139,24 @@ final class Agent {
     }
     var deviceName: String { privacy ? "iPhone" : info?.name ?? "" }
     var liveScreen = false { didSet { send(["cmd": "live_screen", "on": liveScreen]) } }
-    var logFilter = "" { didSet { send(["cmd": "log_filter", "text": logFilter]) } }
+    // Log filters run in the agent too, so the per-flush cap only ever drops lines that would be shown.
+    var logMinLevel = UserDefaults.standard.object(forKey: "logMinLevel") as? Int ?? 2 {  // hide info/debug by default, like Console
+        didSet { UserDefaults.standard.set(logMinLevel, forKey: "logMinLevel"); sendLogFilter() }
+    }
+    var logMuted = Set(UserDefaults.standard.stringArray(forKey: "logMuted") ?? []) {
+        didSet { UserDefaults.standard.set(logMuted.sorted(), forKey: "logMuted"); sendLogFilter() }
+    }
+    var logOnly = "" { didSet { sendLogFilter() } }
+
+    func logPasses(_ l: LogLine) -> Bool {
+        l.rank >= logMinLevel && !logMuted.contains(l.proc) && (logOnly.isEmpty || l.proc == logOnly)
+    }
+
+    private func sendLogFilter() {
+        send(["cmd": "log_filter", "min_level": logMinLevel, "muted": logMuted.sorted(), "only": logOnly])
+    }
 
     private var process: Process?
-    private var buffer = Data()
     private var seq = 0
     private let decoder: JSONDecoder = {
         let d = JSONDecoder()
@@ -156,9 +192,12 @@ final class Agent {
         p.standardOutput = out
         p.standardInput = inp
         p.standardError = errPipe
+        let splitter = LineSplitter()
         out.fileHandleForReading.readabilityHandler = { [weak self] h in
-            let data = h.availableData
-            DispatchQueue.main.async { MainActor.assumeIsolated { self?.consume(data) } }
+            // Split off the main thread: a screenshot is a multi-MB line that arrives in dozens of chunks.
+            let lines = splitter.feed(h.availableData)
+            guard !lines.isEmpty else { return }
+            DispatchQueue.main.async { MainActor.assumeIsolated { lines.forEach { self?.handle($0) } } }
         }
         errPipe.fileHandleForReading.readabilityHandler = { [weak self] h in
             guard let s = String(data: h.availableData, encoding: .utf8), !s.isEmpty else { return }
@@ -175,6 +214,7 @@ final class Agent {
         do {
             try p.run()
             process = p
+            sendLogFilter()
         } catch {
             lastError = "No se pudo lanzar el agente: \(error.localizedDescription)"
         }
@@ -202,15 +242,6 @@ final class Agent {
         info = nil; battery = nil; system = nil; procs = []; logs = []; apps = nil; crashes = nil; crash = nil
         screenshot = nil; devStatus = "conectando"; devMessage = nil
         cpuHistory = []; memHistory = []; netInHistory = []; netOutHistory = []; powerHistory = []
-    }
-
-    private func consume(_ data: Data) {
-        buffer.append(data)
-        while let nl = buffer.firstIndex(of: 0x0A) {
-            let line = buffer[buffer.startIndex..<nl]
-            buffer.removeSubrange(buffer.startIndex...nl)
-            handle(Data(line))
-        }
     }
 
     private func push(_ history: inout [Point], _ value: Double) {
@@ -245,9 +276,9 @@ final class Agent {
             case "procs":
                 procs = try decoder.decode(Items<Proc>.self, from: line).items
             case "logs":
-                guard !logsPaused else { return }
                 let l = try decoder.decode(Logs.self, from: line)
                 logsDropped += l.dropped
+                logRate = l.rate ?? 0
                 for var item in l.items {
                     seq += 1
                     item.id = seq

@@ -39,6 +39,17 @@ INFO_FIELDS = {
 }
 
 
+# syslog level -> rank used by the app's level filter (Console's default level sits at 2)
+LEVEL_RANK = {"DEBUG": 0, "INFO": 1, "NOTICE": 2, "USER_ACTION": 2, "ERROR": 3, "FAULT": 4}
+# shared by every session so it survives device changes; set by the app with the log_filter command
+LOG_FILTER = {"min_level": 0, "muted": set(), "only": ""}
+
+
+def log_passes(proc, level):
+    f = LOG_FILTER
+    return LEVEL_RANK.get(level, 2) >= f["min_level"] and proc not in f["muted"] and (not f["only"] or proc == f["only"])
+
+
 def emit(t, **data):
     OUT.write(json.dumps({"t": t, **data}, default=str) + "\n")
     OUT.flush()
@@ -55,7 +66,6 @@ class Session:
         self.udid = udid
         self.ld = None
         self.dvt = None
-        self.log_filter = ""
         self.live_screen = False
         self.tasks = []
 
@@ -107,23 +117,23 @@ class Session:
             await asyncio.sleep(2)
 
     async def syslog_loop(self):
-        batch, dropped, last = [], 0, time.monotonic()
+        batch, dropped, seen, last = [], 0, 0, time.monotonic()
         while True:
             try:
                 async with await self.connect() as ld:
                     async for e in OsTraceService(lockdown=ld).syslog():
+                        seen += 1
                         proc = os.path.basename(e.filename)
-                        f = self.log_filter
-                        if f and f not in proc.lower() and f not in e.message.lower():
-                            continue
-                        if len(batch) < 400:  # firehose cap per flush; the UI only keeps a window anyway
-                            batch.append({"ts": e.timestamp.strftime("%H:%M:%S.%f")[:-3], "pid": e.pid, "proc": proc,
-                                          "level": e.level.name, "msg": e.message})
-                        else:
-                            dropped += 1
-                        if time.monotonic() - last > 0.5:
-                            emit("logs", items=batch, dropped=dropped)
-                            batch, dropped, last = [], 0, time.monotonic()
+                        if log_passes(proc, e.level.name):
+                            if len(batch) < 400:  # firehose cap per flush; the UI only keeps a window anyway
+                                batch.append({"ts": e.timestamp.strftime("%H:%M:%S.%f")[:-3], "pid": e.pid, "proc": proc,
+                                              "level": e.level.name, "msg": e.message,
+                                              "sub": e.label.subsystem if e.label else "", "cat": e.label.category if e.label else ""})
+                            else:
+                                dropped += 1
+                        if (elapsed := time.monotonic() - last) > 0.5:
+                            emit("logs", items=batch, dropped=dropped, rate=round(seen / elapsed))
+                            batch, dropped, seen, last = [], 0, 0, time.monotonic()
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -263,6 +273,8 @@ async def main():
         try:
             if name == "select":
                 await switch(cmd["udid"])
+            elif name == "log_filter":  # global, so it may arrive before any device is connected
+                LOG_FILTER.update(min_level=int(cmd.get("min_level", 0)), muted=set(cmd.get("muted", [])), only=cmd.get("only", ""))
             elif not session:
                 emit("error", where=name, msg="No hay iPhone conectado")
             elif name == "apps":
@@ -275,8 +287,6 @@ async def main():
                 await session.screenshot()
             elif name == "live_screen":
                 session.live_screen = bool(cmd.get("on"))
-            elif name == "log_filter":
-                session.log_filter = cmd.get("text", "").lower()
         except Exception as e:
             err(name, e)
 
