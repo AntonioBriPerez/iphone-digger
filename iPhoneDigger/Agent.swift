@@ -1,6 +1,8 @@
 import AppKit
+import CoreLocation
 import Foundation
 import Observation
+import UserNotifications
 
 // MARK: - Events sent by agent/agent.py (one JSON object per line)
 
@@ -64,11 +66,64 @@ struct AppItem: Decodable, Identifiable {
     let version: String?
     let staticSize, dynamicSize: Double
     let background, permissions: [String]
+    let sharing: Bool?
     var id: String { bundle }
     var total: Double { staticSize + dynamicSize }
     enum CodingKeys: String, CodingKey {
-        case bundle, name, version, background, permissions
+        case bundle, name, version, background, permissions, sharing
         case staticSize = "static", dynamicSize = "dynamic"
+    }
+}
+
+/// Traffic between one process and one remote address, accumulated since the Network page was first opened.
+struct NetFlow: Decodable, Identifiable {
+    let proc, ip, host: String
+    let ports: [Int]
+    let rx, tx: Double
+    let packets: Int
+    let last: Double
+    var id: String { proc + "|" + ip }
+    var total: Double { rx + tx }
+    var app: String { proc == "?" ? "Sistema" : proc }
+    var destination: String { host.isEmpty ? ip : host }
+}
+
+struct SecurityReport: Decodable {
+    struct Profile: Decodable, Identifiable { let id, name: String; let removable, active: Bool }
+    struct AppNote: Decodable, Identifiable { let name, bundle, detail: String; var id: String { bundle } }
+    let supervised: Bool?
+    let profiles: [Profile]
+    let sideloaded, traffic: [AppNote]
+}
+
+struct RemoteFile: Decodable, Identifiable, Hashable {
+    let name: String
+    let dir: Bool
+    let size, mtime: Double
+    var id: String { name }
+}
+
+/// One battery sample kept on disk so the Battery page can show hours and days, not just this session.
+struct BatteryRecord: Identifiable {
+    let date: Date
+    let level: Int
+    let plugged: Bool
+    let loadMw: Int?
+    let tempC: Double?
+    let topProc: String
+    var id: Date { date }
+
+    var csv: String {
+        [String(Int(date.timeIntervalSince1970)), String(level), plugged ? "1" : "0", loadMw.map(String.init) ?? "",
+         tempC.map { String(format: "%.1f", $0) } ?? "", topProc.replacingOccurrences(of: ",", with: " ")].joined(separator: ",")
+    }
+}
+
+extension BatteryRecord {
+    init?(csv line: Substring) {
+        let f = line.split(separator: ",", omittingEmptySubsequences: false)
+        guard f.count == 6, let t = Double(f[0]), let level = Int(f[1]) else { return nil }
+        self.init(date: Date(timeIntervalSince1970: t), level: level, plugged: f[2] == "1", loadMw: Int(f[3]), tempC: Double(f[4]), topProc: String(f[5]))
     }
 }
 
@@ -85,6 +140,17 @@ private struct Dev: Decodable { let status: String; let msg: String? }
 private struct Crash: Decodable { let path, text: String }
 private struct Shot: Decodable { let png: String }
 private struct AgentError: Decodable { let `where`: String; let msg: String }
+private struct Files: Decodable { let bundle, dir: String; let items: [RemoteFile]; let msg: String }
+private struct Pcap: Decodable { let on: Bool; let packets: Int; let path: String }
+private struct Location: Decodable { let lat, lon: Double? }
+
+/// Shows crash notifications even while the app is in front (macOS hides them by default).
+private final class NotificationPresenter: NSObject, UNUserNotificationCenterDelegate {
+    static let shared = NotificationPresenter()
+    func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification) async -> UNNotificationPresentationOptions {
+        [.banner, .sound]
+    }
+}
 
 /// Turns the agent's stdout chunks into complete lines. Only touched from the pipe's serial handler queue.
 final class LineSplitter: @unchecked Sendable {
@@ -129,6 +195,17 @@ final class Agent {
     var netInHistory: [Point] = []
     var netOutHistory: [Point] = []
     var powerHistory: [Point] = []
+    var net: [NetFlow] = []
+    var pcap: (on: Bool, packets: Int, path: String)?
+    var security: SecurityReport?
+    var files: (bundle: String, dir: String, items: [RemoteFile])?
+    var filesBusy = false
+    var fileMessage: String?
+    var simulatedLocation: CLLocationCoordinate2D?
+    var batteryLog: [BatteryRecord] = []
+    var perfLog: [String]?  // CSV rows while a performance session is being recorded
+    private var knownCrashes: Set<String>?
+    private var lastNotified: [String: Date] = [:]
 
     /// Hides identifiers (serial, UDID, IMEI, phone, MACs, device name) so screenshots can be shared.
     var privacy = UserDefaults.standard.bool(forKey: "privacy") { didSet { UserDefaults.standard.set(privacy, forKey: "privacy") } }
@@ -211,6 +288,8 @@ final class Agent {
                 }
             }
         }
+        UNUserNotificationCenter.current().delegate = NotificationPresenter.shared
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
         do {
             try p.run()
             process = p
@@ -221,6 +300,10 @@ final class Agent {
     }
 
     func stop() {
+        if simulatedLocation != nil {  // don't leave the phone stuck at a fake position after quitting
+            send(["cmd": "location"])
+            Thread.sleep(forTimeInterval: 0.5)
+        }
         process?.terminationHandler = nil
         process?.terminate()
         process = nil
@@ -242,6 +325,83 @@ final class Agent {
         info = nil; battery = nil; system = nil; procs = []; logs = []; apps = nil; crashes = nil; crash = nil
         screenshot = nil; devStatus = "conectando"; devMessage = nil
         cpuHistory = []; memHistory = []; netInHistory = []; netOutHistory = []; powerHistory = []
+        net = []; pcap = nil; security = nil; files = nil; filesBusy = false; fileMessage = nil
+        simulatedLocation = nil; batteryLog = []; perfLog = nil; knownCrashes = nil
+    }
+
+    func fileOp(_ bundle: String, _ op: String, path: String, local: String = "") {
+        filesBusy = true
+        send(["cmd": "files", "bundle": bundle, "op": op, "path": path, "local": local])
+    }
+
+    // MARK: Battery history (one CSV per iPhone in Application Support)
+
+    /// Daemons busy because this app is measuring the phone (stats, live logs, screenshots); they would top every energy ranking.
+    static func isInstrumentation(_ name: String) -> Bool {
+        ["sysmond", "DTServiceHub", "diagnosticd"].contains(name) || name.hasPrefix("com.apple.dt.")
+    }
+
+    static let historyWindow: TimeInterval = 30 * 86400
+    private var batteryFile: URL? {
+        info.map { URL.applicationSupportDirectory.appending(path: "iPhoneDigger/battery-\($0.udid).csv") }
+    }
+
+    private func loadBatteryLog() {
+        let cutoff = Date.now.addingTimeInterval(-Self.historyWindow)
+        let text = batteryFile.flatMap { try? String(contentsOf: $0, encoding: .utf8) } ?? ""
+        batteryLog = text.split(separator: "\n").compactMap(BatteryRecord.init(csv:)).filter { $0.date > cutoff }
+        if let url = batteryFile, batteryLog.count < text.count(where: { $0 == "\n" }) {  // drop expired lines
+            try? (batteryLog.map(\.csv).joined(separator: "\n") + "\n").write(to: url, atomically: true, encoding: .utf8)
+        }
+    }
+
+    private func recordBattery(_ b: Battery) {
+        guard let url = batteryFile, let level = b.level,
+              Date.now.timeIntervalSince(batteryLog.last?.date ?? .distantPast) >= 30 else { return }
+        let r = BatteryRecord(date: .now, level: level, plugged: b.external == true, loadMw: b.systemLoadMw, tempC: b.tempC,
+                              topProc: procs.filter { !Self.isInstrumentation($0.name) }.max { $0.power < $1.power }?.name ?? "")
+        batteryLog.append(r)
+        let line = Data((r.csv + "\n").utf8)
+        if let h = try? FileHandle(forWritingTo: url) {
+            _ = try? h.seekToEnd()
+            try? h.write(contentsOf: line)
+            try? h.close()
+        } else {
+            try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? line.write(to: url)
+        }
+    }
+
+    // MARK: Performance session recording
+
+    static let perfHeader = "hora,cpu_%,memoria_gb,red_bajada_kbs,red_subida_kbs,disco_lectura_kbs,disco_escritura_kbs,consumo_mw,bateria_%,proceso_top_cpu,cpu_proceso_top_%"
+
+    private func recordPerf(_ s: SystemSample) {
+        let top = procs.max { $0.cpu < $1.cpu }
+        let r = s.rates
+        perfLog?.append([
+            Date.now.ISO8601Format(.iso8601(timeZone: .current)), String(format: "%.1f", s.cpu ?? 0), String(format: "%.2f", s.memUsed / 1_073_741_824),
+            String(format: "%.1f", (r["netBytesIn"] ?? 0) / 1024), String(format: "%.1f", (r["netBytesOut"] ?? 0) / 1024),
+            String(format: "%.1f", (r["diskBytesRead"] ?? 0) / 1024), String(format: "%.1f", (r["diskBytesWritten"] ?? 0) / 1024),
+            battery?.systemLoadMw.map(String.init) ?? "", battery?.level.map(String.init) ?? "",
+            (top?.name ?? "").replacingOccurrences(of: ",", with: " "), String(format: "%.1f", top?.cpu ?? 0),
+        ].joined(separator: ","))
+    }
+
+    // MARK: Crash notifications
+
+    private func notifyNewCrashes(_ paths: Set<String>) {
+        // At most one notification per process every 6 h: some apps crash on a loop (a watch app every 20 min).
+        let reports = paths.map(CrashReport.init).filter {
+            $0.kind.worthNotifying && Date.now.timeIntervalSince(lastNotified[$0.process] ?? .distantPast) > 6 * 3600
+        }
+        guard !reports.isEmpty else { return }
+        reports.forEach { lastNotified[$0.process] = .now }
+        let c = UNMutableNotificationContent()
+        c.title = reports.count == 1 ? "Nuevo fallo en el iPhone" : "\(reports.count) fallos nuevos en el iPhone"
+        c.body = reports.prefix(3).map { "\($0.process): \($0.kind.title.lowercased())" }.joined(separator: "\n")
+        c.sound = .default
+        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil))
     }
 
     private func push(_ history: inout [Point], _ value: Double) {
@@ -260,13 +420,16 @@ final class Agent {
                 devices = new
             case "info":
                 info = try decoder.decode(DeviceInfo.self, from: line)
+                loadBatteryLog()
             case "battery":
                 let b = try decoder.decode(Battery.self, from: line)
                 battery = b
                 if let mw = b.systemLoadMw { push(&powerHistory, Double(mw)) }
+                recordBattery(b)
             case "system":
                 let s = try decoder.decode(SystemSample.self, from: line)
                 system = s
+                recordPerf(s)
                 push(&cpuHistory, s.cpu ?? 0)
                 push(&memHistory, s.memUsed / 1_073_741_824)
                 if let i = s.rates["netBytesIn"], let o = s.rates["netBytesOut"] {
@@ -292,7 +455,26 @@ final class Agent {
             case "apps":
                 apps = try decoder.decode(Items<AppItem>.self, from: line).items
             case "crashes":
-                crashes = try decoder.decode(Items<String>.self, from: line).items
+                let items = try decoder.decode(Items<String>.self, from: line).items
+                crashes = items
+                if let known = knownCrashes { notifyNewCrashes(Set(items).subtracting(known)) }
+                knownCrashes = Set(items)
+            case "net":
+                net = try decoder.decode(Items<NetFlow>.self, from: line).items
+            case "pcap":
+                let p = try decoder.decode(Pcap.self, from: line)
+                if pcap?.on == true && !p.on { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: p.path)]) }
+                pcap = (p.on, p.packets, p.path)
+            case "security":
+                security = try decoder.decode(SecurityReport.self, from: line)
+            case "files":
+                let f = try decoder.decode(Files.self, from: line)
+                files = (f.bundle, f.dir, f.items)
+                filesBusy = false
+                if !f.msg.isEmpty { fileMessage = f.msg }
+            case "location":
+                let l = try decoder.decode(Location.self, from: line)
+                simulatedLocation = l.lat.flatMap { lat in l.lon.map { CLLocationCoordinate2D(latitude: lat, longitude: $0) } }
             case "crash":
                 let c = try decoder.decode(Crash.self, from: line)
                 crash = (c.path, c.text)
@@ -302,6 +484,7 @@ final class Agent {
             case "error":
                 let e = try decoder.decode(AgentError.self, from: line)
                 lastError = "\(e.where): \(e.msg)"
+                if e.where == "files" { filesBusy = false; fileMessage = "Error: \(e.msg)" }
             default:
                 break
             }

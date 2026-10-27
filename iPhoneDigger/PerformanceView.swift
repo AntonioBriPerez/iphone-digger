@@ -40,6 +40,32 @@ struct PerformanceView: View {
             }
             .padding(20)
         }
+        .toolbar {
+            if let rows = agent.perfLog {
+                Button("Descartar", role: .destructive) { agent.perfLog = nil }
+                Button(action: savePerf) { Label("Detener y guardar (\(rows.count) s)", systemImage: "stop.circle.fill") }
+                    .labelStyle(.titleAndIcon)
+                    .tint(.red)
+            } else {
+                Button { agent.perfLog = [] } label: { Label("Grabar sesión", systemImage: "record.circle") }
+                    .help("Guarda CPU, memoria, red, disco, consumo y el proceso más activo cada segundo, para exportarlo a CSV")
+            }
+        }
+    }
+
+    private func savePerf() {
+        guard let rows = agent.perfLog else { return }
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.commaSeparatedText]
+        panel.nameFieldStringValue = "iphone-rendimiento-\(Int(Date().timeIntervalSince1970)).csv"
+        guard panel.runModal() == .OK, let url = panel.url else { return }  // cancelled: keep recording
+        do {
+            try ([Agent.perfHeader] + rows).joined(separator: "\n").appending("\n").write(to: url, atomically: true, encoding: .utf8)
+            agent.perfLog = nil
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        } catch {
+            agent.lastError = "No se pudo guardar el CSV: \(error.localizedDescription)"
+        }
     }
 
     private func header(_ title: String, value: String?) -> some View {
