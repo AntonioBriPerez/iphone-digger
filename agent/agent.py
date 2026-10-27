@@ -64,6 +64,10 @@ class Session:
         for coro in (self.info(), self.battery_loop(), self.syslog_loop(), self.dev_loop(), self.screen_loop()):
             self.tasks.append(asyncio.create_task(coro))
 
+    async def connect(self):
+        """Dedicated lockdown connection: concurrent service starts on one shared client get their replies mixed up."""
+        return await create_using_usbmux(serial=self.udid)
+
     def stop(self):
         for t in self.tasks:
             t.cancel()
@@ -85,7 +89,7 @@ class Session:
              fields=[[label, str(v[k])] for k, label in INFO_FIELDS.items() if v.get(k) not in (None, "")])
 
     async def battery_loop(self):
-        diag = DiagnosticsService(lockdown=self.ld)
+        diag = DiagnosticsService(lockdown=await self.connect())
         while True:
             try:
                 b = await diag.get_battery() or {}
@@ -106,19 +110,20 @@ class Session:
         batch, dropped, last = [], 0, time.monotonic()
         while True:
             try:
-                async for e in OsTraceService(lockdown=self.ld).syslog():
-                    proc = os.path.basename(e.filename)
-                    f = self.log_filter
-                    if f and f not in proc.lower() and f not in e.message.lower():
-                        continue
-                    if len(batch) < 400:  # firehose cap per flush; the UI only keeps a window anyway
-                        batch.append({"ts": e.timestamp.strftime("%H:%M:%S.%f")[:-3], "pid": e.pid, "proc": proc,
-                                      "level": e.level.name, "msg": e.message})
-                    else:
-                        dropped += 1
-                    if time.monotonic() - last > 0.5:
-                        emit("logs", items=batch, dropped=dropped)
-                        batch, dropped, last = [], 0, time.monotonic()
+                async with await self.connect() as ld:
+                    async for e in OsTraceService(lockdown=ld).syslog():
+                        proc = os.path.basename(e.filename)
+                        f = self.log_filter
+                        if f and f not in proc.lower() and f not in e.message.lower():
+                            continue
+                        if len(batch) < 400:  # firehose cap per flush; the UI only keeps a window anyway
+                            batch.append({"ts": e.timestamp.strftime("%H:%M:%S.%f")[:-3], "pid": e.pid, "proc": proc,
+                                          "level": e.level.name, "msg": e.message})
+                        else:
+                            dropped += 1
+                        if time.monotonic() - last > 0.5:
+                            emit("logs", items=batch, dropped=dropped)
+                            batch, dropped, last = [], 0, time.monotonic()
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -143,7 +148,7 @@ class Session:
                 if not mounted:
                     mounted = True
                     try:  # DVT needs the Developer Disk Image; it stays mounted until the phone reboots
-                        await auto_mount(self.ld)
+                        await auto_mount(await self.connect())
                         continue
                     except Exception as me:
                         emit("dev", status="unavailable", msg=f"No se pudo montar la imagen de desarrollador: {me}")
@@ -198,7 +203,8 @@ class Session:
             err("screenshot", e)
 
     async def apps(self):
-        apps = await InstallationProxyService(lockdown=self.ld).get_apps(application_type="User", calculate_sizes=True)
+        async with await self.connect() as ld:
+            apps = await InstallationProxyService(lockdown=ld).get_apps(application_type="User", calculate_sizes=True)
         items = []
         for bid, a in apps.items():
             items.append({"bundle": bid, "name": a.get("CFBundleDisplayName") or a.get("CFBundleName") or bid,
@@ -209,11 +215,11 @@ class Session:
         emit("apps", items=items)
 
     async def crashes(self):
-        async with CrashReportsManager(self.ld) as cr:
+        async with await self.connect() as ld, CrashReportsManager(ld) as cr:
             emit("crashes", items=[p for p in await cr.ls("/", depth=-1) if "." in os.path.basename(p)])
 
     async def crash(self, path):
-        async with CrashReportsManager(self.ld) as cr:
+        async with await self.connect() as ld, CrashReportsManager(ld) as cr:
             emit("crash", path=path, text=(await cr.afc.get_file_contents(path)).decode(errors="replace"))
 
 
@@ -274,14 +280,21 @@ async def main():
         except Exception as e:
             err(name, e)
 
-    asyncio.create_task(watch_devices())
+    running = set()  # the event loop only keeps weak refs to tasks; unreferenced ones get collected mid-flight
+
+    def spawn(coro):
+        task = asyncio.create_task(coro)
+        running.add(task)
+        task.add_done_callback(running.discard)
+
+    spawn(watch_devices())
     emit("hello", version=1)
     while True:
         line = await loop.run_in_executor(None, sys.stdin.readline)
         if not line:  # app closed the pipe
             break
         try:
-            asyncio.create_task(run(json.loads(line)))
+            spawn(run(json.loads(line)))
         except json.JSONDecodeError:
             pass
     if session:
