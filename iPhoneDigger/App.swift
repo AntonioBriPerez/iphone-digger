@@ -19,16 +19,22 @@ struct iPhoneDiggerApp: App {
 }
 
 enum Page: String, CaseIterable, Identifiable {
-    case overview = "Resumen", performance = "Rendimiento", processes = "Procesos", screen = "Pantalla"
-    case apps = "Apps", logs = "Logs en vivo", crashes = "Fallos"
+    case overview = "Resumen", performance = "Rendimiento", battery = "Batería", processes = "Procesos", network = "Red"
+    case screen = "Pantalla", apps = "Apps", files = "Archivos", security = "Seguridad", location = "Ubicación"
+    case logs = "Logs en vivo", crashes = "Fallos"
     var id: Self { self }
     var icon: String {
         switch self {
         case .overview: "iphone"
         case .performance: "waveform.path.ecg"
+        case .battery: "battery.75"
         case .processes: "cpu"
+        case .network: "network"
         case .screen: "rectangle.on.rectangle"
         case .apps: "square.grid.3x3"
+        case .files: "folder"
+        case .security: "lock.shield"
+        case .location: "location"
         case .logs: "text.alignleft"
         case .crashes: "exclamationmark.triangle"
         }
@@ -64,9 +70,14 @@ struct ContentView: View {
                     switch section ?? .overview {
                     case .overview: OverviewView()
                     case .performance: PerformanceView()
+                    case .battery: BatteryView()
                     case .processes: ProcessesView()
+                    case .network: NetworkView()
                     case .screen: ScreenView()
                     case .apps: AppsView()
+                    case .files: FilesView()
+                    case .security: SecurityView()
+                    case .location: LocationView()
                     case .logs: LogsView()
                     case .crashes: CrashesView()
                     }
