@@ -8,7 +8,7 @@ struct ProcessesView: View {
     var body: some View {
         let rows = agent.procs
             .filter { search.isEmpty || $0.name.localizedCaseInsensitiveContains(search) || "\($0.pid)" == search }
-            .sorted(using: sort)
+            .sorted(using: sort + [KeyPathComparator(\Proc.pid)])  // fixed tie order: rows only move when their value does
         VStack(spacing: 0) {
             DeveloperBanner().padding([.horizontal, .top], 12)
             Table(rows, sortOrder: $sort) {
@@ -20,6 +20,7 @@ struct ProcessesView: View {
                 TableColumn("Escrito en disco", value: \.diskW) { Text(bytes($0.diskW)).monospacedDigit() }.width(110)
                 TableColumn("Hilos") { Text(verbatim: String($0.threads ?? 0)).monospacedDigit() }.width(50)
             }
+            .id(sort)  // re-sorting reloads instead of diffing ~600 row moves, each of which AppKit sizes off-screen
         }
         .searchable(text: $search, prompt: "Filtrar procesos")
         .navigationSubtitle("\(agent.procs.count) procesos")
